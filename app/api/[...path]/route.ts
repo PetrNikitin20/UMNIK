@@ -2,6 +2,8 @@ import {env} from 'cloudflare:workers';
 import {blank,allFields,initialNews,type Payload} from '@/lib/workbook';
 import {evaluate,validatePayload} from '@/lib/evaluation';
 import {digest,token,passwordHash,verify,equal} from '@/lib/security';
+import {isCalendarDate,reportInterval} from '@/lib/calendar';
+import {newsSources,parseUmnikFeed,pageContent,reviewedNews} from '@/lib/news';
 export const dynamic='force-dynamic';
 type User={id:string;name:string;login:string;role:string;must_change:number;active:number;password_hash:string};
 const db=()=>{if(!env.DB) throw new Error('База данных пока недоступна');return env.DB;};
@@ -38,23 +40,36 @@ async function state(id:string) {
 function sameOrigin(req:Request) {const origin=req.headers.get('origin');if(origin!==new URL(req.url).origin) throw new ApiError('Запрос должен поступить с сайта',403);}
 function validUrl(value:unknown){if(typeof value!=='string') return false;try{return new URL(value).protocol==='https:';}catch{return false;}}
 export async function syncNews(actor:string|null) {
- const sources=['https://fasie.ru/programs/programma-umnik/','https://fasie.ru/press/fund/umnik-2026/'];const checks=[];
- for(const source of sources) {
+ const checks=[];
+ for(const {url:source,name,kind} of newsSources) {
   try {
-   const res=await fetch(source,{signal:AbortSignal.timeout(10000),headers:{'User-Agent':'UMNIK-Educational-Tracker/1.0'}});
+   const res=await fetch(source,{signal:AbortSignal.timeout(8000),headers:{'User-Agent':'UMNIK-Educational-Tracker/1.0'},redirect:'manual'});
    if(!res.ok) throw new Error(`Источник вернул HTTP ${res.status}`);
-   const html=(await res.text()).slice(0,1000000);
-   const normalized=html.replace(/<script[\s\S]*?<\/script>/gi,'').replace(/<style[\s\S]*?<\/style>/gi,'').replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim();
+   const text=await res.text();if(text.length>1000000)throw new Error('Источник превышает допустимый размер');
+   const candidates=kind==='rss'?parseUmnikFeed(text):[];
+   const normalized=kind==='rss'?JSON.stringify(candidates):pageContent(text);
+   if(!normalized||kind==='page'&&!/умник/iu.test(normalized))throw new Error('Содержимое источника не распознано; проверьте вручную');
    const sourceHash=await digest(normalized);
    const prior=await first<{value:string}>('SELECT value FROM settings WHERE key=?','source:'+source);
    const changed=prior?.value!==sourceHash;
    const statements=[stmt('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','source:'+source,sourceHash)];
-   if(changed) statements.push(stmt('INSERT INTO news(id,title,body,source,status,source_hash,checked_at,created_at) VALUES(?,?,?,?,?,?,?,?)',crypto.randomUUID(),'Обновление источника Фонда требует проверки',normalized.slice(Math.max(0,normalized.toLowerCase().indexOf('умник')-100),Math.max(0,normalized.toLowerCase().indexOf('умник')-100)+4000),source,'draft',sourceHash,now(),now()));
-   await db().batch(statements);checks.push({source,ok:true,changed});
-  }catch(err){checks.push({source,ok:false,message:err instanceof Error?err.message:'Источник недоступен'});}
+   // Stable IDs prevent repeated/concurrent checks from duplicating drafts, including archived ones.
+   if(kind==='rss')for(const item of candidates) {
+    const hash=await digest(JSON.stringify(item));
+    const body=`Региональное представительство ФСИ · Саратовская область. Дата публикации: ${item.publicationDate} (московский календарь). Краткое описание источника: ${item.summary}\n\nЧерновик для проверки преподавателем. Откройте источник, уточните территорию участия и актуальность дат. Региональное объявление не подтверждает прием для студентов в Москве. Укажите дату события только после сверки.`;
+    statements.push(stmt('INSERT OR IGNORE INTO news(id,title,body,source,status,source_hash,checked_at,created_at) VALUES(?,?,?,?,?,?,?,?)','source-'+hash,'Региональный источник · '+item.title,body,item.source,'draft',hash,now(),now()));
+   }
+   else if(changed) {
+    const start=Math.max(0,normalized.toLowerCase().indexOf('умник')-100);
+    statements.push(stmt('INSERT OR IGNORE INTO news(id,title,body,source,status,source_hash,checked_at,created_at) VALUES(?,?,?,?,?,?,?,?)','source-'+await digest(source+sourceHash),'Обновление источника Фонда требует проверки',normalized.slice(start,start+700)+'\n\nКраткий фрагмент. Откройте источник и проверьте актуальные сведения перед публикацией.',source,'draft',sourceHash,now(),now()));
+   }
+   const saved=await db().batch(statements);checks.push({source,name,ok:true,changed,found:candidates.length,created:saved.slice(1).reduce((sum,r)=>sum+(r.meta.changes||0),0)});
+  }catch(err){checks.push({source,name,ok:false,message:err instanceof Error?err.message:'Источник недоступен'});}
  }
- await db().batch([stmt('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','newsLastCheck',JSON.stringify({at:now(),checks})),auditStmt(actor,'news_check',null,checks)]);
- return {at:now(),checks};
+ const timestamp=now(),report={at:timestamp,checks};
+ // Only these code-reviewed summaries can be published by synchronization. Imported items remain drafts.
+ await db().batch([...reviewedNews.map(x=>stmt('INSERT OR IGNORE INTO news(id,title,body,source,event_date,status,checked_at,created_at) VALUES(?,?,?,?,?,?,?,?)',x.id,x.title,x.body,x.source,x.eventDate,'published',timestamp,timestamp)),stmt('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','newsLastCheck',JSON.stringify(report)),auditStmt(actor,'news_check',null,report)]);
+ return report;
 }
 async function advisory(payload:Payload,result:ReturnType<typeof evaluate>,name:string) {
  if(!env.GROQ_API_KEY) return {status:'not_configured',message:'LLM не подключена. Проверка по тетради выполнена полностью; ключ Groq задается в защищенных настройках хостинга.'};
@@ -89,16 +104,16 @@ export async function GET(req:Request) {
   if(path==='admin/student') {const id=url.searchParams.get('id')||'';const target=await first<User>('SELECT * FROM users WHERE id=?',id);if(!target)throw new ApiError('Студент не найден',404);return json({user:pub(target),...await state(id),revisions:await list('SELECT version,changes,created_at FROM revisions WHERE user_id=? ORDER BY version DESC',id)});}
   if(path==='admin/report') {
    const kind=url.searchParams.get('kind')||'students';const from=url.searchParams.get('from')||'2000-01-01';const to=url.searchParams.get('to')||'2100-01-01';
-   if(!/^\d{4}-\d{2}-\d{2}$/.test(from)||!/^\d{4}-\d{2}-\d{2}$/.test(to)||from>to) throw new ApiError('Проверьте период отчета');
-   const queries:Record<string,string>={students:'SELECT u.name ФИО,u.login Логин,u.role Роль,u.last_login Последний_вход,(SELECT MAX(version) FROM revisions r WHERE r.user_id=u.id) Версия,(SELECT result FROM evaluations e WHERE e.user_id=u.id ORDER BY e.created_at DESC LIMIT 1) Оценка FROM users u ORDER BY u.name',evaluations:'SELECT u.name ФИО,e.version Версия,e.created_at Дата,e.result Результат FROM evaluations e JOIN users u ON u.id=e.user_id WHERE substr(e.created_at,1,10) BETWEEN ? AND ? ORDER BY e.created_at DESC',changes:'SELECT u.name ФИО,r.version Версия,r.created_at Дата,r.changes Изменения FROM revisions r JOIN users u ON u.id=r.user_id WHERE substr(r.created_at,1,10) BETWEEN ? AND ? ORDER BY r.created_at DESC',audit:'SELECT a.created_at Дата,u.name Автор,a.event Событие,a.target_id Объект,a.detail Детали FROM audit a LEFT JOIN users u ON u.id=a.actor_id WHERE substr(a.created_at,1,10) BETWEEN ? AND ? ORDER BY a.created_at DESC',reviews:'SELECT u.name ФИО,r.version Версия,r.status Статус,r.comment Комментарий,r.created_at Дата FROM reviews r JOIN users u ON u.id=r.user_id WHERE substr(r.created_at,1,10) BETWEEN ? AND ?'};
+   let interval:ReturnType<typeof reportInterval>;try{interval=reportInterval(from,to);}catch{throw new ApiError('Проверьте период отчета');}
+   const queries:Record<string,string>={students:'SELECT u.name ФИО,u.login Логин,u.role Роль,u.last_login Последний_вход,(SELECT MAX(version) FROM revisions r WHERE r.user_id=u.id) Версия,(SELECT result FROM evaluations e WHERE e.user_id=u.id ORDER BY e.created_at DESC LIMIT 1) Оценка FROM users u ORDER BY u.name',evaluations:'SELECT u.name ФИО,e.version Версия,e.created_at Дата,e.result Результат FROM evaluations e JOIN users u ON u.id=e.user_id WHERE e.created_at>=? AND e.created_at<? ORDER BY e.created_at DESC',changes:'SELECT u.name ФИО,r.version Версия,r.created_at Дата,r.changes Изменения FROM revisions r JOIN users u ON u.id=r.user_id WHERE r.created_at>=? AND r.created_at<? ORDER BY r.created_at DESC',audit:'SELECT a.created_at Дата,u.name Автор,a.event Событие,a.target_id Объект,a.detail Детали FROM audit a LEFT JOIN users u ON u.id=a.actor_id WHERE a.created_at>=? AND a.created_at<? ORDER BY a.created_at DESC',reviews:'SELECT u.name ФИО,r.version Версия,r.status Статус,r.comment Комментарий,r.created_at Дата FROM reviews r JOIN users u ON u.id=r.user_id WHERE r.created_at>=? AND r.created_at<?'};
    if(kind==='archive') {
     const tables=['users','revisions','evaluations','reviews','news','audit','settings'];
     const data=await db().batch(tables.map(t=>stmt(t==='users'?'SELECT id,name,login,role,active,created_at,last_login FROM users':t==='settings'?"SELECT * FROM settings WHERE key NOT LIKE 'secret:%'":`SELECT * FROM ${t}`)));
     await auditStmt(u.id,'export_archive',null,{tables}).run();
     return json({format:'umnik-educational-archive-v1',at:now(),notice:'Учебная выгрузка без паролей и сессий. Не заменяет резервную копию БД.',tables:Object.fromEntries(tables.map((t,i)=>[t,data[i].results]))},200,{'Content-Disposition':'attachment; filename="umnik-archive.json"'});
    }
-   if(!queries[kind])throw new ApiError('Неизвестный отчет');const rows=await list(queries[kind],...(kind==='students'?[]:[from,to]));
-   await auditStmt(u.id,'export_report',null,{kind,from,to,rows:rows.length}).run();
+   if(!queries[kind])throw new ApiError('Неизвестный отчет');const rows=await list(queries[kind],...(kind==='students'?[]:[interval.start,interval.end]));
+   await auditStmt(u.id,'export_report',null,{kind,from,to,timeZone:'Europe/Moscow',rows:rows.length}).run();
    return new Response(csv(rows),{headers:{'Content-Type':'text/csv; charset=utf-8','Content-Disposition':`attachment; filename="umnik-${kind}.csv"`,'Cache-Control':'no-store'}});
   }
   throw new ApiError('Не найдено',404);
@@ -165,8 +180,10 @@ export async function POST(req:Request) {
   }
   if(path==='admin/news') {
    if(!body.title||String(body.title).length>250||!body.body||String(body.body).length>10000||!validUrl(body.source)||!['draft','published','archived'].includes(body.status))throw new ApiError('Укажите название, текст, HTTPS источник и статус');
-   if(body.eventDate&&!/^\d{4}-\d{2}-\d{2}$/.test(body.eventDate))throw new ApiError('Проверьте дату события');
-   const id=body.id||crypto.randomUUID();await db().batch([stmt('INSERT INTO news(id,title,body,source,event_date,status,checked_at,created_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,body=excluded.body,source=excluded.source,event_date=excluded.event_date,status=excluded.status,checked_at=excluded.checked_at',id,body.title,body.body,body.source,body.eventDate||null,body.status,now(),now()),auditStmt(u.id,'news_updated',id,{title:body.title,status:body.status,source:body.source})]);return json({id});
+   if(body.eventDate&&!isCalendarDate(body.eventDate))throw new ApiError('Проверьте дату события');
+   const id=body.id||crypto.randomUUID(),before=await first('SELECT title,body,source,event_date,status FROM news WHERE id=?',id);
+   const after={title:body.title,body:body.body,source:body.source,event_date:body.eventDate||null,status:body.status};
+   await db().batch([stmt('INSERT INTO news(id,title,body,source,event_date,status,checked_at,created_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,body=excluded.body,source=excluded.source,event_date=excluded.event_date,status=excluded.status,checked_at=excluded.checked_at',id,after.title,after.body,after.source,after.event_date,after.status,now(),now()),auditStmt(u.id,'news_updated',id,{before,after})]);return json({id});
   }
   if(path==='admin/user') {
    const target=await first<User>('SELECT * FROM users WHERE id=?',body.id);if(!target||target.role==='admin')throw new ApiError('Выберите студента');

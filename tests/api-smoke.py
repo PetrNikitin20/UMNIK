@@ -49,5 +49,20 @@ for kind in ['students','evaluations','changes','audit','reviews','archive']:
  r=admin.get(base+'/api/admin/report?kind='+kind);check('export '+kind,r.status_code==200 and 'password_hash' not in r.text and password not in r.text)
 check('MCP news write requires bound owner',requests.post(base+'/mcp',json={'jsonrpc':'2.0','id':1,'method':'tools/call','params':{'name':'check_competition_sources','arguments':{}}}).json()['result']['isError'])
 check('history contains field changes',len(student.get(base+'/api/history').json()['revisions'])>=2)
+check('invalid report date rejected',admin.get(base+'/api/admin/report?kind=audit&from=2026-02-30&to=2026-03-01').status_code==400)
+news={'id':'test-news-audit','title':'Учебная проверка журнала новостей','body':'Исходный учебный текст для теста.','source':'https://fsimp.ru/news/197','eventDate':'2026-08-14','status':'draft'}
+check('news impossible event date rejected',admin.post(base+'/api/admin/news',json={**news,'eventDate':'2026-02-30'}).status_code==400)
+check('admin news created',admin.post(base+'/api/admin/news',json=news).status_code==200)
+changed={**news,'body':'Обновленный учебный текст для проверки всех правок.','eventDate':'2026-08-18','status':'archived'}
+check('admin news updated',admin.post(base+'/api/admin/news',json=changed).status_code==200)
+events=admin.get(base+'/api/admin/overview').json()['audit']
+details=[json.loads(x['detail']) for x in events if x['event']=='news_updated' and x['target_id']==news['id']]
+check('news audit preserves before and after text, date and status',any(d.get('before',{}).get('body')==news['body'] and d['after']['body']==changed['body'] and d['after']['event_date']=='2026-08-18' and d['after']['status']=='archived' for d in details if d.get('before')))
+check('student cannot publish news',student.post(base+'/api/admin/news',json=news).status_code==403)
+# Optional fixture records are added only to the isolated local DB by the test runner.
+if '--calendar-fixture' in sys.argv:
+ report=admin.get(base+'/api/admin/report?kind=audit&from=2026-10-01&to=2026-10-01')
+ check('report includes both Moscow day boundaries',report.status_code==200 and 'calendar-start' in report.text and 'calendar-last' in report.text)
+ check('report excludes adjacent Moscow days','calendar-before' not in report.text and 'calendar-end' not in report.text)
 for name in passed:print('PASS',name)
 print(f'{len(passed)} integration checks passed')

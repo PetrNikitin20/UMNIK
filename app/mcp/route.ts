@@ -2,7 +2,7 @@ import {env} from 'cloudflare:workers';
 import {syncNews} from '../api/[...path]/route';
 export const dynamic='force-dynamic';
 const tools=[
- {name:'check_competition_sources',description:'Проверить две официальные страницы УМНИК Фонда. Сохранить изменения только как черновики, не публиковать даты автоматически.',inputSchema:{type:'object',properties:{},additionalProperties:false}},
+ {name:'check_competition_sources',description:'Проверить фиксированные страницы УМНИК Фонда и RSS регионального представительства ФСИ. Новые сообщения источников сохранить только как черновики. Региональные даты требуют проверки применимости для Москвы.',inputSchema:{type:'object',properties:{},additionalProperties:false}},
  {name:'read_news_status',description:'Прочитать результат последней проверки источников и число черновиков новостей.',inputSchema:{type:'object',properties:{},additionalProperties:false}},
 ];
 export async function POST(req:Request){
@@ -11,7 +11,7 @@ export async function POST(req:Request){
   const text=await req.text();if(text.length>10000)return new Response('Request too large',{status:413});
   const rpc=JSON.parse(text);id=rpc.id??null;let result:unknown;
   if(rpc.method==='server/discover')result={supportedVersions:['2026-07-28'],capabilities:{tools:{}}};
-  else if(rpc.method==='initialize')result={protocolVersion:'2025-03-26',capabilities:{tools:{}},serverInfo:{name:'umnik-news',version:'1.0.0'}};
+  else if(rpc.method==='initialize')result={protocolVersion:'2025-03-26',capabilities:{tools:{}},serverInfo:{name:'umnik-news',version:'1.1.0'}};
   else if(rpc.method==='notifications/initialized')return new Response(null,{status:202});
   else if(rpc.method==='tools/list')result={tools};
   else if(rpc.method==='tools/call'){
