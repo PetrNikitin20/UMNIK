@@ -1,0 +1,14 @@
+import assert from 'node:assert/strict';
+import {test} from 'node:test';
+import {evaluate,validatePayload} from '../lib/evaluation';
+import {blank,sections,allFields,admissionIds} from '../lib/workbook';
+test('Eight sections match the workbook and field IDs are unique',()=>{assert.equal(sections.length,8);assert.deepEqual(sections.map(s=>s.page),[2,3,4,5,6,7,8,9]);assert.equal(new Set(allFields.map(f=>f.id)).size,allFields.length);});
+test('Empty first attempt gets substantive comments, not random refusal',()=>{const r=evaluate(blank());assert.equal(r.status,'Требуется доработка');assert.ok(r.issues.length>40);assert.equal(r.completion,0);assert.deepEqual(evaluate(blank()),r);});
+test('Formal incompatibility is not fixed by long project text',()=>{const p=blank();p.age='Нет';const r=evaluate(p);assert.equal(r.status,'Формальные препятствия');assert.ok(r.issues.some(i=>i.field==='age'&&i.severity==='blocker'));});
+test('All admission checks affirmative removes admission issues only',()=>{const p=blank();admissionIds.forEach(id=>p[id]='Да');const r=evaluate(p);assert.ok(!r.issues.some(i=>admissionIds.includes(i.field)));assert.equal(r.status,'Требуется доработка');});
+test('Title requirement accepts Cyrillic and checks first word',()=>{const p=blank();p.title='Разработка модуля анализа данных';assert.ok(!evaluate(p).issues.some(i=>i.field==='title'));p.title='Создание модуля анализа данных';assert.ok(evaluate(p).issues.some(i=>i.field==='title'));});
+test('Annotation length is advice, never a formal blocker',()=>{const r=evaluate(blank());assert.ok(r.issues.some(i=>i.field==='annotation'&&i.severity==='advice'));assert.ok(!r.issues.some(i=>i.field==='annotation'&&i.severity==='blocker'));});
+test('Tables require meaningful columns and required row counts',()=>{const p=blank();p.tasks=[{Задача:'Изучить литературу',Артефакт:'Обзор источников'}];assert.ok(evaluate(p).issues.some(i=>i.field==='tasks'&&i.severity==='major'));});
+test('Payload rejects invalid options and oversized or malformed rows',()=>{assert.throws(()=>validatePayload({direction:'admin'}));assert.throws(()=>validatePayload({tasks:[{Задача:12,Артефакт:'test'}]}));assert.throws(()=>validatePayload({title:'x'.repeat(15001)}));});
+test('Unknown and privilege fields are discarded',()=>{const r=validatePayload({...blank(),role:'admin',userId:'someone-else'});assert.equal(r.role,undefined);assert.equal(r.userId,undefined);});
+test('Honest absence of measurements and short group identifier are accepted',()=>{const p=blank();p.initialResult='Пока не измерено';p.group='ПМ-2, 2 курс';const r=evaluate(p);assert.ok(!r.issues.some(i=>['initialResult','group'].includes(i.field)));});
