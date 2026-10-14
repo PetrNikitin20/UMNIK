@@ -4,6 +4,7 @@ import {evaluate,validatePayload} from '@/lib/evaluation';
 import {digest,token,passwordHash,verify,equal} from '@/lib/security';
 import {isCalendarDate,reportInterval} from '@/lib/calendar';
 import {newsSources,parseUmnikFeed,pageContent,reviewedNews} from '@/lib/news';
+import {learningGet,learningPost,umnikContext,umnikMutationStatements,LearningError} from '@/lib/learning-server';
 export const dynamic='force-dynamic';
 type User={id:string;name:string;login:string;role:string;must_change:number;active:number;password_hash:string};
 const db=()=>{if(!env.DB) throw new Error('База данных пока недоступна');return env.DB;};
@@ -31,11 +32,11 @@ async function limit(key:string,max:number,seconds:number) {
  const row=await first<{count:number}>('SELECT count FROM limits WHERE key=?',key);
  if(row!.count>max) throw new ApiError('Слишком много запросов. Повторите позже.',429);
 }
-async function latest(id:string) {return first<{version:number;payload:string;created_at:string}>('SELECT version,payload,created_at FROM revisions WHERE user_id=? ORDER BY version DESC LIMIT 1',id);}
-async function state(id:string) {
- const r=await latest(id), e=await first<{result:string;version:number;created_at:string}>('SELECT result,version,created_at FROM evaluations WHERE user_id=? ORDER BY created_at DESC LIMIT 1',id);
+async function latest(id:string,key='umnik-main') {return first<{version:number;payload:string;created_at:string}>('SELECT version,payload,created_at FROM revisions WHERE user_id=? AND work_key=? ORDER BY version DESC LIMIT 1',id,key);}
+async function state(id:string,key='umnik-main') {
+ const r=await latest(id,key), e=await first<{result:string;version:number;created_at:string}>('SELECT result,version,created_at FROM evaluations WHERE user_id=? AND work_key=? ORDER BY created_at DESC LIMIT 1',id,key);
  return {version:r?.version||0,payload:r?JSON.parse(r.payload):blank(),savedAt:r?.created_at||null,evaluation:e?{...JSON.parse(e.result),version:e.version,createdAt:e.created_at}:null,
-  reviews:await list('SELECT version,status,comment,created_at FROM reviews WHERE user_id=? ORDER BY created_at DESC',id)};
+  reviews:await list('SELECT version,status,comment,created_at FROM reviews WHERE user_id=? AND work_key=? ORDER BY created_at DESC',id,key)};
 }
 function sameOrigin(req:Request) {const origin=req.headers.get('origin');if(origin!==new URL(req.url).origin) throw new ApiError('Запрос должен поступить с сайта',403);}
 function validUrl(value:unknown){if(typeof value!=='string') return false;try{return new URL(value).protocol==='https:';}catch{return false;}}
@@ -96,16 +97,17 @@ export async function GET(req:Request) {
   if(path==='health') return json({ok:true});
   if(path==='news') return json({news:await list("SELECT id,title,body,source,event_date,checked_at FROM news WHERE status='published' ORDER BY event_date DESC,created_at DESC"),lastCheck:await first('SELECT value FROM settings WHERE key=?','newsLastCheck')});
   if(path==='me') {const u=await session(req);return json({user:u?pub(u):null,llmConfigured:!!env.GROQ_API_KEY});}
+  if(path.startsWith('platform/'))return learningGet(req,await session(req));
   const u=await requireUser(req,path.startsWith('admin/'));
-  if(path==='application') return json(await state(u.id));
-  if(path==='history') return json({revisions:await list('SELECT version,changes,created_at FROM revisions WHERE user_id=? ORDER BY version DESC',u.id),evaluations:await list('SELECT version,result,created_at FROM evaluations WHERE user_id=? ORDER BY created_at DESC',u.id)});
-  if(path==='revision') {const version=Number(url.searchParams.get('version'));return json(await first('SELECT version,payload,created_at FROM revisions WHERE user_id=? AND version=?',u.id,version));}
-  if(path==='admin/overview') return json({users:await list(`SELECT u.id,u.name,u.login,u.role,u.active,u.must_change,u.last_login, (SELECT MAX(version) FROM revisions r WHERE r.user_id=u.id) as version, (SELECT result FROM evaluations e WHERE e.user_id=u.id ORDER BY e.created_at DESC LIMIT 1) as evaluation, (SELECT version FROM evaluations e WHERE e.user_id=u.id ORDER BY e.created_at DESC LIMIT 1) as evaluated_version FROM users u ORDER BY u.name`),news:await list('SELECT * FROM news ORDER BY created_at DESC'),audit:await list('SELECT a.*,u.name actor FROM audit a LEFT JOIN users u ON u.id=a.actor_id ORDER BY a.created_at DESC LIMIT 100'),llmConfigured:!!env.GROQ_API_KEY});
-  if(path==='admin/student') {const id=url.searchParams.get('id')||'';const target=await first<User>('SELECT * FROM users WHERE id=?',id);if(!target)throw new ApiError('Студент не найден',404);return json({user:pub(target),...await state(id),revisions:await list('SELECT version,changes,created_at FROM revisions WHERE user_id=? ORDER BY version DESC',id)});}
+  if(path==='application') {const ctx=await umnikContext(req,u,false);return json(await state(u.id,ctx.key));}
+  if(path==='history') {const ctx=await umnikContext(req,u,false);return json({revisions:await list('SELECT version,changes,created_at FROM revisions WHERE user_id=? AND work_key=? ORDER BY version DESC',u.id,ctx.key),evaluations:await list('SELECT version,result,created_at FROM evaluations WHERE user_id=? AND work_key=? ORDER BY created_at DESC',u.id,ctx.key)});}
+  if(path==='revision') {const ctx=await umnikContext(req,u,false),version=Number(url.searchParams.get('version'));return json(await first('SELECT version,payload,created_at FROM revisions WHERE user_id=? AND work_key=? AND version=?',u.id,ctx.key,version));}
+  if(path==='admin/overview') return json({users:await list(`SELECT u.id,u.name,u.login,u.role,u.active,u.must_change,u.last_login, (SELECT MAX(version) FROM revisions r WHERE r.user_id=u.id AND r.work_key='umnik-main') as version, (SELECT result FROM evaluations e WHERE e.user_id=u.id AND e.work_key='umnik-main' ORDER BY e.created_at DESC LIMIT 1) as evaluation, (SELECT version FROM evaluations e WHERE e.user_id=u.id AND e.work_key='umnik-main' ORDER BY e.created_at DESC LIMIT 1) as evaluated_version FROM users u ORDER BY u.name`),news:await list('SELECT * FROM news ORDER BY created_at DESC'),audit:await list('SELECT a.*,u.name actor FROM audit a LEFT JOIN users u ON u.id=a.actor_id ORDER BY a.created_at DESC LIMIT 100'),llmConfigured:!!env.GROQ_API_KEY});
+  if(path==='admin/student') {const id=url.searchParams.get('id')||'';const target=await first<User>('SELECT * FROM users WHERE id=?',id);if(!target)throw new ApiError('Студент не найден',404);return json({user:pub(target),...await state(id),revisions:await list("SELECT version,changes,created_at FROM revisions WHERE user_id=? AND work_key='umnik-main' ORDER BY version DESC",id)});}
   if(path==='admin/report') {
    const kind=url.searchParams.get('kind')||'students';const from=url.searchParams.get('from')||'2000-01-01';const to=url.searchParams.get('to')||'2100-01-01';
    let interval:ReturnType<typeof reportInterval>;try{interval=reportInterval(from,to);}catch{throw new ApiError('Проверьте период отчета');}
-   const queries:Record<string,string>={students:'SELECT u.name ФИО,u.login Логин,u.role Роль,u.last_login Последний_вход,(SELECT MAX(version) FROM revisions r WHERE r.user_id=u.id) Версия,(SELECT result FROM evaluations e WHERE e.user_id=u.id ORDER BY e.created_at DESC LIMIT 1) Оценка FROM users u ORDER BY u.name',evaluations:'SELECT u.name ФИО,e.version Версия,e.created_at Дата,e.result Результат FROM evaluations e JOIN users u ON u.id=e.user_id WHERE e.created_at>=? AND e.created_at<? ORDER BY e.created_at DESC',changes:'SELECT u.name ФИО,r.version Версия,r.created_at Дата,r.changes Изменения FROM revisions r JOIN users u ON u.id=r.user_id WHERE r.created_at>=? AND r.created_at<? ORDER BY r.created_at DESC',audit:'SELECT a.created_at Дата,u.name Автор,a.event Событие,a.target_id Объект,a.detail Детали FROM audit a LEFT JOIN users u ON u.id=a.actor_id WHERE a.created_at>=? AND a.created_at<? ORDER BY a.created_at DESC',reviews:'SELECT u.name ФИО,r.version Версия,r.status Статус,r.comment Комментарий,r.created_at Дата FROM reviews r JOIN users u ON u.id=r.user_id WHERE r.created_at>=? AND r.created_at<?'};
+   const queries:Record<string,string>={students:'SELECT u.name ФИО,u.login Логин,u.role Роль,u.last_login Последний_вход,(SELECT MAX(version) FROM revisions r WHERE r.user_id=u.id AND r.work_key=\'umnik-main\') Версия,(SELECT result FROM evaluations e WHERE e.user_id=u.id AND e.work_key=\'umnik-main\' ORDER BY e.created_at DESC LIMIT 1) Оценка FROM users u ORDER BY u.name',evaluations:'SELECT u.name ФИО,e.version Версия,e.created_at Дата,e.result Результат FROM evaluations e JOIN users u ON u.id=e.user_id WHERE e.created_at>=? AND e.created_at<? ORDER BY e.created_at DESC',changes:'SELECT u.name ФИО,r.version Версия,r.created_at Дата,r.changes Изменения FROM revisions r JOIN users u ON u.id=r.user_id WHERE r.created_at>=? AND r.created_at<? ORDER BY r.created_at DESC',audit:'SELECT a.created_at Дата,u.name Автор,a.event Событие,a.target_id Объект,a.detail Детали FROM audit a LEFT JOIN users u ON u.id=a.actor_id WHERE a.created_at>=? AND a.created_at<? ORDER BY a.created_at DESC',reviews:'SELECT u.name ФИО,r.version Версия,r.status Статус,r.comment Комментарий,r.created_at Дата FROM reviews r JOIN users u ON u.id=r.user_id WHERE r.created_at>=? AND r.created_at<?'};
    if(kind==='archive') {
     const tables=['users','revisions','evaluations','reviews','news','audit','settings'];
     const data=await db().batch(tables.map(t=>stmt(t==='users'?'SELECT id,name,login,role,active,created_at,last_login FROM users':t==='settings'?"SELECT * FROM settings WHERE key NOT LIKE 'secret:%'":`SELECT * FROM ${t}`)));
@@ -117,7 +119,7 @@ export async function GET(req:Request) {
    return new Response(csv(rows),{headers:{'Content-Type':'text/csv; charset=utf-8','Content-Disposition':`attachment; filename="umnik-${kind}.csv"`,'Cache-Control':'no-store'}});
   }
   throw new ApiError('Не найдено',404);
- }catch(e){return json({error:e instanceof Error?e.message:'Ошибка'},e instanceof ApiError?e.status:500);}
+ }catch(e){return json({error:e instanceof Error?e.message:'Ошибка'},e instanceof ApiError||e instanceof LearningError?e.status:500);}
 }
 export async function POST(req:Request) {
  try {
@@ -151,6 +153,7 @@ export async function POST(req:Request) {
    return json({user:pub(u)},200,{'Set-Cookie':`umnik_session=${sessionToken}; Path=/; HttpOnly; SameSite=Strict; Max-Age=28800${secure}`});
   }
   const u=await requireUser(req,path.startsWith('admin/'),['password','logout'].includes(path));
+  if(path.startsWith('platform/'))return learningPost(req,u,body);
   if(path==='logout') {const cookie=req.headers.get('cookie')?.match(/umnik_session=([a-f0-9]{64})/)?.[1];if(cookie)await stmt('DELETE FROM sessions WHERE token_hash=?',await digest(cookie)).run();return json({ok:true},200,{'Set-Cookie':'umnik_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0; Secure'});}
   if(path==='password') {
    const next=String(body.password||'');await limit('password:'+u.id,5,3600);
@@ -160,17 +163,17 @@ export async function POST(req:Request) {
    await db().batch([stmt('UPDATE users SET password_hash=?,must_change=0 WHERE id=?',await passwordHash(next),u.id),stmt('DELETE FROM sessions WHERE user_id=?',u.id),auditStmt(u.id,'password_changed',u.id,{})]);return json({ok:true,relogin:true},200,{'Set-Cookie':'umnik_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0; Secure'});
   }
   if(path==='application') {
-   await limit('save:'+u.id,180,3600);const payload=validatePayload(body.payload);const current=await latest(u.id);const version=current?.version||0;
+   const ctx=await umnikContext(req,u);await limit('save:'+u.id,180,3600);const payload=validatePayload(body.payload);const current=await latest(u.id,ctx.key);const version=current?.version||0;
    if(body.version!==version)throw new ApiError('Заявка изменена в другой вкладке. Обновите данные перед сохранением.',409);
    const previous=current?JSON.parse(current.payload):blank();const changes=allFields.filter(f=>JSON.stringify(previous[f.id])!==JSON.stringify(payload[f.id])).map(f=>({field:f.id,label:f.label,before:previous[f.id],after:payload[f.id]}));
    if(!changes.length)return json({version,savedAt:current?.created_at||null});const timestamp=now();
-   try {await db().batch([stmt('INSERT INTO revisions(id,user_id,version,payload,changes,created_at) VALUES(?,?,?,?,?,?)',crypto.randomUUID(),u.id,version+1,JSON.stringify(payload),JSON.stringify(changes),timestamp),auditStmt(u.id,'application_saved',u.id,{version:version+1,fields:changes.map(x=>x.field)})]);}catch{throw new ApiError('Конфликт сохранения. Обновите заявку и повторите.',409);}
+   try {await db().batch([stmt('INSERT INTO revisions(id,user_id,work_key,version,payload,changes,created_at) VALUES(?,?,?,?,?,?,?)',crypto.randomUUID(),u.id,ctx.key,version+1,JSON.stringify(payload),JSON.stringify(changes),timestamp),auditStmt(u.id,'application_saved',u.id,{assignment:ctx.assignment.id,version:version+1,fields:changes.map(x=>x.field)}),...umnikMutationStatements(u,ctx,'saved',version+1,{fields:changes.map(x=>x.field)})]);}catch{throw new ApiError('Конфликт сохранения. Обновите заявку и повторите.',409);}
    return json({version:version+1,savedAt:timestamp});
   }
   if(path==='evaluate') {
-   await limit('evaluate:'+u.id,20,3600);const r=await latest(u.id);if(!r)throw new ApiError('Сначала сохраните заявку');if(body.version!==r.version)throw new ApiError('Версия заявки изменилась. Обновите данные.',409);
+   const ctx=await umnikContext(req,u);await limit('evaluate:'+u.id,20,3600);const r=await latest(u.id,ctx.key);if(!r)throw new ApiError('Сначала сохраните заявку');if(body.version!==r.version)throw new ApiError('Версия заявки изменилась. Обновите данные.',409);
    const payload=JSON.parse(r.payload) as Payload;const result={...evaluate(payload),llm:body.llmConsent===true?await advisory(payload,evaluate(payload),u.name):{status:'disabled',message:'Использована проверка по тетради. Передача текста внешней LLM выключена.'}};
-   await db().batch([stmt('INSERT INTO evaluations(id,user_id,version,result,created_at) VALUES(?,?,?,?,?)',crypto.randomUUID(),u.id,r.version,JSON.stringify(result),now()),auditStmt(u.id,'evaluation',u.id,{version:r.version,llmConsent:body.llmConsent===true,status:result.status})]);return json({...result,version:r.version,createdAt:now()});
+   await db().batch([stmt('INSERT INTO evaluations(id,user_id,work_key,version,result,created_at) VALUES(?,?,?,?,?,?)',crypto.randomUUID(),u.id,ctx.key,r.version,JSON.stringify(result),now()),auditStmt(u.id,'evaluation',u.id,{assignment:ctx.assignment.id,version:r.version,llmConsent:body.llmConsent===true,status:result.status}),...umnikMutationStatements(u,ctx,'checked',r.version,{ruleset:result.ruleset,status:result.status})]);return json({...result,version:r.version,createdAt:now()});
   }
   if(path==='admin/check-news')return json(await syncNews(u.id));
   if(path==='admin/bind-cloud') {
@@ -186,7 +189,7 @@ export async function POST(req:Request) {
    await db().batch([stmt('INSERT INTO news(id,title,body,source,event_date,status,checked_at,created_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,body=excluded.body,source=excluded.source,event_date=excluded.event_date,status=excluded.status,checked_at=excluded.checked_at',id,after.title,after.body,after.source,after.event_date,after.status,now(),now()),auditStmt(u.id,'news_updated',id,{before,after})]);return json({id});
   }
   if(path==='admin/user') {
-   const target=await first<User>('SELECT * FROM users WHERE id=?',body.id);if(!target||target.role==='admin')throw new ApiError('Выберите студента');
+   const target=await first<User>('SELECT * FROM users WHERE id=?',body.id);if(!target||target.role==='admin')throw new ApiError('Выберите учетную запись студента или преподавателя');
    if(body.action==='reset') {const password=token().slice(0,20)+'!aA';await db().batch([stmt('UPDATE users SET password_hash=?,must_change=1 WHERE id=?',await passwordHash(password),target.id),stmt('DELETE FROM sessions WHERE user_id=?',target.id),auditStmt(u.id,'password_reset',target.id,{})]);return json({login:target.login,password});}
    if(body.action==='active'&&typeof body.active==='boolean') {await db().batch([stmt('UPDATE users SET active=? WHERE id=?',body.active?1:0,target.id),stmt('DELETE FROM sessions WHERE user_id=?',target.id),auditStmt(u.id,'access_changed',target.id,{active:body.active})]);return json({ok:true});}
    throw new ApiError('Неизвестное действие');
@@ -197,5 +200,5 @@ export async function POST(req:Request) {
    await db().batch([stmt('INSERT INTO reviews(id,user_id,actor_id,version,status,comment,created_at) VALUES(?,?,?,?,?,?,?)',crypto.randomUUID(),body.id,u.id,r.version,body.status,body.comment,now()),auditStmt(u.id,'teacher_review',body.id,{version:r.version,status:body.status})]);return json({ok:true});
   }
   throw new ApiError('Не найдено',404);
- }catch(e){return json({error:e instanceof ApiError?e.message:e instanceof SyntaxError?'Некорректный JSON':e instanceof Error&&/^(Поле|Пакет|В таблице|Некоррект|Недопустим)/.test(e.message)?e.message:'Операция не выполнена. Проверьте данные или повторите позже.'},e instanceof ApiError?e.status:400);}
+ }catch(e){return json({error:e instanceof ApiError||e instanceof LearningError?e.message:e instanceof SyntaxError?'Некорректный JSON':e instanceof Error&&/^(Поле|Пакет|В таблице|Некоррект|Недопустим)/.test(e.message)?e.message:'Операция не выполнена. Проверьте данные или повторите позже.'},e instanceof ApiError||e instanceof LearningError?e.status:400);}
 }

@@ -1,0 +1,1 @@
+ALTER TABLE `competency_evidence` ADD `module_version` text DEFAULT 'unrecorded' NOT NULL;

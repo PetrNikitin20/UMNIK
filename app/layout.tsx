@@ -1,9 +1,10 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import "./laboratory.css";
 
 export const metadata: Metadata = {
-  title: "УМНИК Практикум — Финансовый университет",
-  description: "Подготовка исследовательской заявки по рабочей тетради. Учебный научный семинар.",
+  title: "Пётр Никитин — образовательная лаборатория",
+  description: "Учебные симуляторы, исследовательские проекты и образовательная аналитика. Автор: Никитин Петр Владимирович, к.пед.н., доцент.",
   icons: {
     icon: "/favicon.svg",
     shortcut: "/favicon.svg",

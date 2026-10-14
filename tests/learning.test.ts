@@ -1,0 +1,13 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {competencySummary,cohortSummary,RUBRIC_VERSION,type Evidence} from '../lib/learning';
+const row=(patch:Partial<Evidence>={}):Evidence=>({id:'first',work_id:'one',user_id:'student',course_id:'research',competency_id:'experiment',phase:'final',score:2,version:1,current_version:1,rubric_version:RUBRIC_VERSION,created_at:'2026-10-01T00:00:00Z',transfer_source:null,comment:'Конкретное основание оценки.',...patch});
+const result=(rows:Evidence[])=>competencySummary(rows).find(c=>c.id==='experiment')!;
+test('activity without teacher evidence does not create a competency level',()=>assert.equal(result([]).level,null));
+test('a changed work excludes old final evidence but retains a matching baseline for delta',()=>{const r=result([row({phase:'baseline',score:1,version:1,current_version:2}),row({score:4,version:1,current_version:2}),row({id:'second',score:3,version:2,current_version:2,created_at:'2026-10-02T00:00:00Z'})]);assert.equal(r.level,3);assert.deepEqual(r.deltas,[{courseId:'research',baseline:1,final:3,delta:2}]);});
+test('different rubric versions are not silently compared',()=>{const r=result([row({phase:'baseline',score:1,rubric_version:'other'}),row({score:3})]);assert.equal(r.deltas.length,0);});
+test('a lower later score replaces an earlier high score within a discipline',()=>{const r=result([row({score:4}),row({id:'later',score:1,created_at:'2026-10-02T00:00:00Z'})]);assert.equal(r.level,1);assert.equal(r.evidenceCount,1);});
+test('results in two courses are distinct from verified transfer',()=>{const r=result([row(),row({id:'other',work_id:'two',course_id:'data',score:3})]);assert.equal(r.evidenceCount,2);assert.equal(r.transferCount,0);});
+test('transfer is current only while the linked source version matches',()=>{assert.equal(result([row({score:3,transfer_source:'source',source_version:1,source_current_version:2})]).transferCount,0);assert.equal(result([row({score:3,transfer_source:'source',source_version:2,source_current_version:2})]).transferCount,1);});
+test('cohort distribution counts one latest result per student, course and competency',()=>{const r=cohortSummary([row({score:4}),row({id:'second',score:2,created_at:'2026-10-02T00:00:00Z'}),row({phase:'baseline',score:1}),row({id:'third',user_id:'other',work_id:'other-work',score:3})])[0];assert.equal(r.students,2);assert.deepEqual(r.levels,[0,0,1,1,0]);assert.equal(r.paired,1);assert.equal(r.improved,1);});
+test('cohort ignores obsolete final versions and incompatible rubrics',()=>assert.deepEqual(cohortSummary([row({current_version:2}),row({rubric_version:'another-version'})]),[]));
