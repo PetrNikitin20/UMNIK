@@ -1,6 +1,9 @@
 """End-to-end checks on the isolated localhost DB, with fictional accounts only."""
-import json,urllib.request,urllib.error,http.cookiejar,uuid,concurrent.futures
-BASE='http://127.0.0.1:5173'
+import json,urllib.request,urllib.error,http.cookiejar,uuid,concurrent.futures,os
+if os.environ.get('UMNIK_TEST_TRANSPORT')=='stdio':
+ from standalone_transport import build_opener
+ urllib.request.build_opener=build_opener
+BASE=os.environ.get('UMNIK_TEST_BASE','http://127.0.0.1:5173')
 PASSWORD='Preview-Test-Password-2026!'
 class Session:
  def __init__(self):self.opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))

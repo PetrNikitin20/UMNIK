@@ -1,5 +1,5 @@
-import {env} from 'cloudflare:workers';
-import {syncNews} from '../api/[...path]/route';
+import {env} from '@/lib/runtime-env';
+import {syncNews} from '@/lib/news-sync';
 export const dynamic='force-dynamic';
 const tools=[
  {name:'check_competition_sources',description:'Проверить фиксированные страницы УМНИК Фонда и RSS регионального представительства ФСИ. Новые сообщения источников сохранить только как черновики. Региональные даты требуют проверки применимости для Москвы.',inputSchema:{type:'object',properties:{},additionalProperties:false}},
@@ -15,6 +15,7 @@ export async function POST(req:Request){
   else if(rpc.method==='notifications/initialized')return new Response(null,{status:202});
   else if(rpc.method==='tools/list')result={tools};
   else if(rpc.method==='tools/call'){
+   if(env.DEPLOYMENT_MODE==='standalone')throw new Error('Cloud identity is unavailable on this server');
    if(!env.DB)throw new Error('База недоступна');
    const owner=await env.DB.prepare('SELECT value FROM settings WHERE key=?').bind('cloudOwnerId').first<{value:string}>();
    const identity=req.headers.get('oai-authenticated-user-id');

@@ -1,5 +1,8 @@
 """Integration tests against an isolated local preview DB, never production."""
-import concurrent.futures,sys,json,urllib.request,urllib.error,http.cookiejar
+import concurrent.futures,sys,json,urllib.request,urllib.error,http.cookiejar,os
+if os.environ.get('UMNIK_TEST_TRANSPORT')=='stdio':
+ from standalone_transport import build_opener
+ urllib.request.build_opener=build_opener
 class Response:
  def __init__(self,r):self.status_code=r.code;self.headers=r.headers;self.text=r.read().decode('utf-8')
  def json(self):return json.loads(self.text)
@@ -18,7 +21,7 @@ class Requests:
  def get(self,url,**kw):return Session().get(url,**kw)
  def post(self,url,**kw):return Session().post(url,**kw)
 requests=Requests()
-base='http://127.0.0.1:5173'
+base=os.environ.get('UMNIK_TEST_BASE','http://127.0.0.1:5173')
 password='Preview-Test-Password-2026!'
 def session(login):
  s=requests.Session();s.headers['Origin']=base

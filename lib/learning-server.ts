@@ -1,4 +1,4 @@
-import {env} from 'cloudflare:workers';
+import {env} from '@/lib/runtime-env';
 import {competencies,modules,starterCourses,starterAssignments,RUBRIC_VERSION,validateExperiment,experimentFeedback,competencySummary,cohortSummary,type Evidence} from './learning';
 import {blank} from './workbook';
 import {digest,passwordHash,token} from './security';

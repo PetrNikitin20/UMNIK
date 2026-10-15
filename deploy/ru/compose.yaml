@@ -1,0 +1,65 @@
+services:
+  app:
+    build:
+      context: ../..
+      dockerfile: deploy/ru/Dockerfile
+    image: umnik-ru:local
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      HOSTNAME: 0.0.0.0
+      PORT: 3000
+      DATABASE_PATH: /app/data/umnik.sqlite
+      APP_ORIGINS: https://petr-nikitin.ru,https://edu.petr-nikitin.ru
+    volumes:
+      - app_data:/app/data
+    healthcheck:
+      test: ["CMD","node","-e","fetch('http://127.0.0.1:3000/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 8s
+      start_period: 30s
+      retries: 3
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+  web:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      app: {condition: service_healthy}
+    ports: ["80:80","443:443","443:443/udp"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+  maintenance:
+    image: umnik-ru:local
+    restart: unless-stopped
+    depends_on:
+      app: {condition: service_healthy}
+    env_file: .env
+    environment:
+      DATABASE_PATH: /app/data/umnik.sqlite
+      BACKUP_DIR: /app/backups
+      APP_ORIGIN: https://edu.petr-nikitin.ru
+      APP_INTERNAL_ORIGIN: http://app:3000
+    command: ["node","deploy/ru/maintenance.mjs"]
+    volumes:
+      - app_data:/app/data
+      - app_backups:/app/backups
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+volumes:
+  app_data:
+  app_backups:
+  caddy_data:
+  caddy_config:
+

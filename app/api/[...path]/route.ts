@@ -1,9 +1,10 @@
-import {env} from 'cloudflare:workers';
+import {env} from '@/lib/runtime-env';
 import {blank,allFields,initialNews,type Payload} from '@/lib/workbook';
 import {evaluate,validatePayload} from '@/lib/evaluation';
 import {digest,token,passwordHash,verify,equal} from '@/lib/security';
 import {isCalendarDate,reportInterval} from '@/lib/calendar';
-import {newsSources,parseUmnikFeed,pageContent,reviewedNews} from '@/lib/news';
+import {syncNews} from '@/lib/news-sync';
+import {requestOrigin,clientAddress} from '@/lib/request-origin';
 import {learningGet,learningPost,umnikContext,umnikMutationStatements,LearningError} from '@/lib/learning-server';
 export const dynamic='force-dynamic';
 type User={id:string;name:string;login:string;role:string;must_change:number;active:number;password_hash:string};
@@ -38,40 +39,8 @@ async function state(id:string,key='umnik-main') {
  return {version:r?.version||0,payload:r?JSON.parse(r.payload):blank(),savedAt:r?.created_at||null,evaluation:e?{...JSON.parse(e.result),version:e.version,createdAt:e.created_at}:null,
   reviews:await list('SELECT version,status,comment,created_at FROM reviews WHERE user_id=? AND work_key=? ORDER BY created_at DESC',id,key)};
 }
-function sameOrigin(req:Request) {const origin=req.headers.get('origin');if(origin!==new URL(req.url).origin) throw new ApiError('Запрос должен поступить с сайта',403);}
+function sameOrigin(req:Request) {const origin=req.headers.get('origin');if(origin!==requestOrigin(req)) throw new ApiError('Запрос должен поступить с сайта',403);}
 function validUrl(value:unknown){if(typeof value!=='string') return false;try{return new URL(value).protocol==='https:';}catch{return false;}}
-export async function syncNews(actor:string|null) {
- const checks=[];
- for(const {url:source,name,kind} of newsSources) {
-  try {
-   const res=await fetch(source,{signal:AbortSignal.timeout(8000),headers:{'User-Agent':'UMNIK-Educational-Tracker/1.0'},redirect:'manual'});
-   if(!res.ok) throw new Error(`Источник вернул HTTP ${res.status}`);
-   const text=await res.text();if(text.length>1000000)throw new Error('Источник превышает допустимый размер');
-   const candidates=kind==='rss'?parseUmnikFeed(text):[];
-   const normalized=kind==='rss'?JSON.stringify(candidates):pageContent(text);
-   if(!normalized||kind==='page'&&!/умник/iu.test(normalized))throw new Error('Содержимое источника не распознано; проверьте вручную');
-   const sourceHash=await digest(normalized);
-   const prior=await first<{value:string}>('SELECT value FROM settings WHERE key=?','source:'+source);
-   const changed=prior?.value!==sourceHash;
-   const statements=[stmt('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','source:'+source,sourceHash)];
-   // Stable IDs prevent repeated/concurrent checks from duplicating drafts, including archived ones.
-   if(kind==='rss')for(const item of candidates) {
-    const hash=await digest(JSON.stringify(item));
-    const body=`Региональное представительство ФСИ · Саратовская область. Дата публикации: ${item.publicationDate} (московский календарь). Краткое описание источника: ${item.summary}\n\nЧерновик для проверки преподавателем. Откройте источник, уточните территорию участия и актуальность дат. Региональное объявление не подтверждает прием для студентов в Москве. Укажите дату события только после сверки.`;
-    statements.push(stmt('INSERT OR IGNORE INTO news(id,title,body,source,status,source_hash,checked_at,created_at) VALUES(?,?,?,?,?,?,?,?)','source-'+hash,'Региональный источник · '+item.title,body,item.source,'draft',hash,now(),now()));
-   }
-   else if(changed) {
-    const start=Math.max(0,normalized.toLowerCase().indexOf('умник')-100);
-    statements.push(stmt('INSERT OR IGNORE INTO news(id,title,body,source,status,source_hash,checked_at,created_at) VALUES(?,?,?,?,?,?,?,?)','source-'+await digest(source+sourceHash),'Обновление источника Фонда требует проверки',normalized.slice(start,start+700)+'\n\nКраткий фрагмент. Откройте источник и проверьте актуальные сведения перед публикацией.',source,'draft',sourceHash,now(),now()));
-   }
-   const saved=await db().batch(statements);checks.push({source,name,ok:true,changed,found:candidates.length,created:saved.slice(1).reduce((sum,r)=>sum+(r.meta.changes||0),0)});
-  }catch(err){checks.push({source,name,ok:false,message:err instanceof Error?err.message:'Источник недоступен'});}
- }
- const timestamp=now(),report={at:timestamp,checks};
- // Only these code-reviewed summaries can be published by synchronization. Imported items remain drafts.
- await db().batch([...reviewedNews.map(x=>stmt('INSERT OR IGNORE INTO news(id,title,body,source,event_date,status,checked_at,created_at) VALUES(?,?,?,?,?,?,?,?)',x.id,x.title,x.body,x.source,x.eventDate,'published',timestamp,timestamp)),stmt('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','newsLastCheck',JSON.stringify(report)),auditStmt(actor,'news_check',null,report)]);
- return report;
-}
 async function advisory(payload:Payload,result:ReturnType<typeof evaluate>,name:string) {
  if(!env.GROQ_API_KEY) return {status:'not_configured',message:'LLM не подключена. Проверка по тетради выполнена полностью; ключ Groq задается в защищенных настройках хостинга.'};
  const allowed=['title','problem','scope','goal','hypothesis','novelty','analogs','dataSource','split','leakage','baseline','method','ablation','metrics','confirmation','tzParameters','stages','risks','segment','benefit','demand','businessModel','market'];
@@ -94,9 +63,9 @@ const csv=(rows:Record<string,unknown>[])=>{const keys=Object.keys(rows[0]||{mes
 export async function GET(req:Request) {
  try {
   const path=new URL(req.url).pathname.slice(5), url=new URL(req.url);
-  if(path==='health') return json({ok:true});
+  if(path==='health') {await first('SELECT 1 ready');return json({ok:true});}
   if(path==='news') return json({news:await list("SELECT id,title,body,source,event_date,checked_at FROM news WHERE status='published' ORDER BY event_date DESC,created_at DESC"),lastCheck:await first('SELECT value FROM settings WHERE key=?','newsLastCheck')});
-  if(path==='me') {const u=await session(req);return json({user:u?pub(u):null,llmConfigured:!!env.GROQ_API_KEY});}
+  if(path==='me') {const u=await session(req);return json({user:u?pub(u):null,llmConfigured:!!env.GROQ_API_KEY,hostingMode:env.DEPLOYMENT_MODE||'sites',newsScheduleConfigured:!!env.NEWS_SYNC_TOKEN});}
   if(path.startsWith('platform/'))return learningGet(req,await session(req));
   const u=await requireUser(req,path.startsWith('admin/'));
   if(path==='application') {const ctx=await umnikContext(req,u,false);return json(await state(u.id,ctx.key));}
@@ -143,13 +112,13 @@ export async function POST(req:Request) {
   if(path==='login') {
    const login=String(body.login||'').trim().toLowerCase(); const password=String(body.password||'');
    if(login.length>60||password.length>128)throw new ApiError('Неверный логин или пароль',401);
-   await limit('login-ip:'+await digest(req.headers.get('cf-connecting-ip')||'local'),40,900);await limit('login-user:'+await digest(login),10,900);
+   await limit('login-ip:'+await digest(clientAddress(req)),env.DEPLOYMENT_MODE==='standalone'?500:40,900);await limit('login-user:'+await digest(login),10,900);
    const u=await first<User>('SELECT * FROM users WHERE login=?',login);
    // Dummy derivation keeps unknown-user handling comparable without disclosing names.
    const ok=await verify(password,u?.password_hash||'pbkdf2-sha256$100000$00000000000000000000000000000000$0000000000000000000000000000000000000000000000000000000000000000');
    if(!u||!u.active||!ok)throw new ApiError('Неверный логин или пароль',401);
    const sessionToken=token();await db().batch([stmt('INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)',await digest(sessionToken),u.id,new Date(Date.now()+8*3600000).toISOString()),stmt('UPDATE users SET last_login=? WHERE id=?',now(),u.id),auditStmt(u.id,'login',u.id,{})]);
-   const secure=new URL(req.url).protocol==='https:'?'; Secure':'';
+   const secure=new URL(requestOrigin(req)).protocol==='https:'?'; Secure':'';
    return json({user:pub(u)},200,{'Set-Cookie':`umnik_session=${sessionToken}; Path=/; HttpOnly; SameSite=Strict; Max-Age=28800${secure}`});
   }
   const u=await requireUser(req,path.startsWith('admin/'),['password','logout'].includes(path));
@@ -177,6 +146,7 @@ export async function POST(req:Request) {
   }
   if(path==='admin/check-news')return json(await syncNews(u.id));
   if(path==='admin/bind-cloud') {
+   if(env.DEPLOYMENT_MODE==='standalone')throw new ApiError('На этом сервере используется независимое расписание проверки источников',403);
    const identity=req.headers.get('oai-authenticated-user-id');
    if(!identity)throw new ApiError('Сначала войдите через ChatGPT по ссылке в панели администратора',403);
    await db().batch([stmt('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','cloudOwnerId',identity),auditStmt(u.id,'cloud_updates_bound',u.id,{})]);return json({ok:true});

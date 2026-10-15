@@ -57,4 +57,11 @@ next-env.d.ts
 *.csv
 *seed*.json
 *.tsbuildinfo
+*.sqlite*
+*.db
+/data/
+/backups/
+/private/
 !.env.example
+__pycache__/
+*.pyc
